@@ -19,7 +19,8 @@
 /******************************/
 /*      Macros Definitions    */
 /******************************/
-#define TIMER_CB_PERIOD 10
+#define TIMER_CB_PERIOD 100
+#define MOTOR_MIN_SPEED 5.0f
 
 /******************************/
 /*     Static Variables       */
@@ -44,10 +45,8 @@ typedef struct
   uint32_t timer_us;
   uint32_t remaining_steps;
   uint32_t traveled_steps;
-  uint32_t target_speed;
-  uint32_t current_speed;
-  uint32_t target_period;
-  uint64_t current_period;
+  float target_speed;
+  float current_speed;
   enum motor_profile_type profile;
   uint32_t accel;
   uint32_t decel;
@@ -101,7 +100,7 @@ esp_err_t motor_create(struct motor_config *config, motor_handle_t *handle)
       .clk_src = GPTIMER_CLK_SRC_DEFAULT,
       .direction = GPTIMER_COUNT_UP,
       .resolution_hz = 1 * 1000 * 1000,
-      .intr_priority = 0
+      .intr_priority = 1
     };
 
     static gptimer_alarm_config_t alarm_cfg =
@@ -249,14 +248,15 @@ esp_err_t motor_turn(motor_handle_t handle, int32_t steps, uint32_t speed)
   motor->traveled_steps = 0;
   motor->remaining_steps = steps;
   motor->target_speed = speed;
-  motor->current_speed = motor->profile == MOTOR_PROFILE_CONSTANT ? speed : 1;
-  motor->target_period = 1000000 / motor->target_speed;
-  motor->current_period = 1000000 / motor->current_speed;
+  motor->current_speed = motor->profile == MOTOR_PROFILE_CONSTANT ? speed : MOTOR_MIN_SPEED;
 
   if (motor->profile == MOTOR_PROFILE_LINEAR)
   {
-    motor->accel_steps = (motor->target_speed * motor->target_speed - motor->current_speed * motor->current_speed) / (2 * motor->accel);
-    motor->decel_steps = (motor->target_speed * motor->target_speed - motor->current_speed * motor->current_speed) / (2 * motor->decel);
+    motor->accel_steps = (speed * speed - motor->current_speed * motor->current_speed) / (2 * motor->accel);
+    motor->decel_steps = (speed * speed - motor->current_speed * motor->current_speed) / (2 * motor->decel);
+
+    if (motor->accel_steps > steps / 2) motor->accel_steps = steps / 2;
+    if (motor->decel_steps > steps / 2) motor->decel_steps = steps / 2;
   }
 
   gpio_set_level(motor->step_pin, 1);
@@ -267,13 +267,13 @@ esp_err_t motor_turn(motor_handle_t handle, int32_t steps, uint32_t speed)
 }
 
 
-uint32_t motor_get_current_speed(motor_handle_t handle)
+float motor_get_current_speed(motor_handle_t handle)
 {
   motor_ctrl_t *motor = GET_MOTOR(handle, 0);
   return motor->current_speed;
 }
 
-uint32_t motor_get_target_speed(motor_handle_t handle)
+float motor_get_target_speed(motor_handle_t handle)
 {
   motor_ctrl_t *motor = GET_MOTOR(handle, 0);
   return motor->target_speed;
@@ -355,14 +355,33 @@ bool timer_callback(gptimer_handle_t timer, const gptimer_alarm_event_data_t *ed
     motor->timer_us += TIMER_CB_PERIOD;
 
     /* Calculations */
-    uint32_t on_period = 30 * motor->current_period / 100;
+    uint32_t period = (uint32_t)(1000000.0f / motor->current_speed);
+    uint32_t on_period = 30 * period / 100;
     if (on_period < 2) on_period = 2;
 
-    if (motor->timer_us >= motor->current_period)
+    if (motor->timer_us >= period)
     {
       motor->timer_us = 0;
       motor->remaining_steps--;
       motor->traveled_steps++;
+
+      if (motor->traveled_steps < motor->accel_steps)
+      {
+        motor->state = MOTOR_STATE_ACCEL;
+        motor->current_speed += (float)motor->accel * (float)period / 1000000.0f;
+        if (motor->current_speed > motor->target_speed) motor->current_speed = motor->target_speed;
+      }
+      else if (motor->remaining_steps < motor->decel_steps)
+      {
+        motor->state = MOTOR_STATE_DECEL;
+        motor->current_speed -= (float)motor->decel * (float)period / 1000000.0f;
+        if (motor->current_speed < MOTOR_MIN_SPEED) motor->current_speed =  MOTOR_MIN_SPEED;
+      }
+      else
+      {
+        motor->state = MOTOR_STATE_CRUISE;
+        motor->current_speed = motor->target_speed;
+      }
     }
 
     if (motor->timer_us <= on_period)
@@ -380,22 +399,6 @@ bool timer_callback(gptimer_handle_t timer, const gptimer_alarm_event_data_t *ed
         gpio_set_level(motor->step_pin, 0);
         motor->step_state = 0;
       }
-    }
-
-    if (motor->traveled_steps < motor->accel_steps)
-    {
-      motor->state = MOTOR_STATE_ACCEL;
-      motor->current_period = (motor->current_period * 1000000000000LL) / (1000000000000LL + motor->accel * motor->current_period * MAX_MOTOR_COUNT);
-    }
-    else if (motor->remaining_steps < motor->decel_steps)
-    {
-      motor->state = MOTOR_STATE_DECEL;
-      motor->current_period = (motor->current_period * 1000000000000LL) / (1000000000000LL - motor->decel * motor->current_period * MAX_MOTOR_COUNT);
-    }
-    else
-    {
-      motor->state = MOTOR_STATE_CRUISE;
-      motor->current_period = motor->target_period;
     }
   }
 

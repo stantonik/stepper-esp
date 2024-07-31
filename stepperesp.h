@@ -21,7 +21,7 @@ extern "C" {
 /******************************/
 /*      Macro Definitions     */
 /******************************/
-#define MAX_MOTOR_COUNT 5
+#define MAX_MOTOR_COUNT 4
 
 /******************************/
 /*   Typedefs, Struct, Enums  */
@@ -79,8 +79,8 @@ extern esp_err_t motor_disable(motor_handle_t handle);
 extern esp_err_t motor_delete(motor_handle_t *handle);
 extern esp_err_t motor_delete_all();
 
-extern uint32_t motor_get_current_speed(motor_handle_t handle);
-extern uint32_t motor_get_target_speed(motor_handle_t handle);
+extern float motor_get_current_speed(motor_handle_t handle);
+extern float motor_get_target_speed(motor_handle_t handle);
 extern enum motor_state motor_get_state(motor_handle_t handle);
 extern uint32_t motor_get_remaining_steps(motor_handle_t handle);
 extern uint32_t motor_get_traveled_steps(motor_handle_t handle);
