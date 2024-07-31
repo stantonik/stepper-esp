@@ -17,6 +17,11 @@
 #include "esp_check.h"
 
 /******************************/
+/*      Macros Definitions    */
+/******************************/
+#define TIMER_CB_PERIOD 10
+
+/******************************/
 /*     Static Variables       */
 /******************************/
 #define TAG "stepper-esp"
@@ -32,6 +37,7 @@ typedef struct
 
   enum motor_state state;
   enum motor_dir dir;
+  bool step_state;
   bool ready;
   bool is_en_pin; 
 
@@ -40,11 +46,13 @@ typedef struct
   uint32_t traveled_steps;
   uint32_t target_speed;
   uint32_t current_speed;
+  uint32_t target_period;
+  uint64_t current_period;
   enum motor_profile_type profile;
   uint32_t accel;
   uint32_t decel;
-  uint32_t accel_inc;
-  uint32_t decel_inc;
+  uint32_t accel_inc_us;
+  uint32_t decel_inc_us;
   uint32_t accel_steps;
   uint32_t decel_steps;
   uint32_t real_step_per_rev;
@@ -98,7 +106,7 @@ esp_err_t motor_create(struct motor_config *config, motor_handle_t *handle)
 
     static gptimer_alarm_config_t alarm_cfg =
     {
-      .alarm_count = 10,
+      .alarm_count = TIMER_CB_PERIOD,
       .reload_count = 0,
       .flags = { .auto_reload_on_alarm = true }
     };
@@ -123,6 +131,7 @@ esp_err_t motor_create(struct motor_config *config, motor_handle_t *handle)
     {
       handles[i] = handle;
       motors[i] = motor;
+      motors[i]->ready = false;
       break;
     }
   }
@@ -131,7 +140,7 @@ esp_err_t motor_create(struct motor_config *config, motor_handle_t *handle)
   gpio_reset_pin(config->dir_pin);
   gpio_set_direction(config->dir_pin, GPIO_MODE_OUTPUT);
   gpio_reset_pin(config->step_pin);
-  gpio_set_direction(config->en_pin, GPIO_MODE_OUTPUT);
+  gpio_set_direction(config->step_pin, GPIO_MODE_OUTPUT);
   if (is_en_pin)
   {
     gpio_reset_pin(config->en_pin);
@@ -223,6 +232,40 @@ esp_err_t motor_delete_all()
 }
 
 
+esp_err_t motor_turn(motor_handle_t handle, int32_t steps, uint32_t speed)
+{
+  motor_ctrl_t *motor = GET_MOTOR(handle, -1);
+  if (speed == 0 || steps == 0) return 0; 
+  ESP_RETURN_ON_FALSE(motor->state != MOTOR_STATE_DISABLE, -1, TAG, "enable %c motor first", motor->name);
+  ESP_RETURN_ON_FALSE(motor->state == MOTOR_STATE_STILL, -1, TAG, "%c motor is already running", motor->name);
+
+  /* Set motor direction */
+  motor->dir = (steps > 0 ? MOTOR_DIR_CW : MOTOR_DIR_CCW);
+  gpio_set_level(motor->dir_pin, motor->dir);
+
+  /* Calculations */
+  steps = abs(steps);
+  motor->timer_us = 0;
+  motor->traveled_steps = 0;
+  motor->remaining_steps = steps;
+  motor->target_speed = speed;
+  motor->current_speed = motor->profile == MOTOR_PROFILE_CONSTANT ? speed : 1;
+  motor->target_period = 1000000 / motor->target_speed;
+  motor->current_period = 1000000 / motor->current_speed;
+
+  if (motor->profile == MOTOR_PROFILE_LINEAR)
+  {
+    motor->accel_steps = (motor->target_speed * motor->target_speed - motor->current_speed * motor->current_speed) / (2 * motor->accel);
+    motor->decel_steps = (motor->target_speed * motor->target_speed - motor->current_speed * motor->current_speed) / (2 * motor->decel);
+  }
+
+  gpio_set_level(motor->step_pin, 1);
+  motor->step_state = 1;
+  motor->ready = true;
+
+  return ESP_OK;
+}
+
 
 uint32_t motor_get_current_speed(motor_handle_t handle)
 {
@@ -277,7 +320,10 @@ esp_err_t motor_set_profile(motor_handle_t handle, struct motor_profile_config *
   motor_ctrl_t *motor = GET_MOTOR(handle, -1);
   ESP_RETURN_ON_FALSE(profile != NULL, -1, TAG, "profile is null");
 
-  memcpy(motor + offsetof(motor_ctrl_t, profile), profile, sizeof(struct motor_profile_config));
+  /* memcpy(motor + offsetof(motor_ctrl_t, profile), profile, sizeof(struct motor_profile_config)); */
+  motor->accel = profile->accel;
+  motor->decel = profile->decel;
+  motor->profile = profile->type;
 
   return ESP_OK;
 }
@@ -286,5 +332,72 @@ esp_err_t motor_set_profile(motor_handle_t handle, struct motor_profile_config *
 // ISR
 bool timer_callback(gptimer_handle_t timer, const gptimer_alarm_event_data_t *edata, void *user_ctx)
 {
+  for (int i = 0; i < MAX_MOTOR_COUNT; i++)
+  {
+    motor_ctrl_t *motor = motors[i];
+    if (motor == NULL || !motor->ready) continue;
+
+    /* Destination reached */
+    if (motor->remaining_steps <= 0)
+    {
+      gpio_set_level(motor->step_pin, 0);
+      motor->step_state = 0;
+      motor->state = MOTOR_STATE_STILL;
+      motor->ready = false;
+
+      motor->timer_us = 0;
+      motor->traveled_steps = 0;
+      motor->target_speed = 0;
+      motor->current_speed = 0;
+      continue;
+    }
+
+    motor->timer_us += TIMER_CB_PERIOD;
+
+    /* Calculations */
+    uint32_t on_period = 30 * motor->current_period / 100;
+    if (on_period < 2) on_period = 2;
+
+    if (motor->timer_us >= motor->current_period)
+    {
+      motor->timer_us = 0;
+      motor->remaining_steps--;
+      motor->traveled_steps++;
+    }
+
+    if (motor->timer_us <= on_period)
+    {
+      if (motor->step_state == 0) 
+      {
+        gpio_set_level(motor->step_pin, 1);
+        motor->step_state = 1;
+      }
+    }
+    else
+    {
+      if (motor->step_state == 1)
+      {
+        gpio_set_level(motor->step_pin, 0);
+        motor->step_state = 0;
+      }
+    }
+
+    if (motor->traveled_steps < motor->accel_steps)
+    {
+      motor->state = MOTOR_STATE_ACCEL;
+      motor->current_period = (motor->current_period * 1000000000000LL) / (1000000000000LL + motor->accel * motor->current_period * MAX_MOTOR_COUNT);
+    }
+    else if (motor->remaining_steps < motor->decel_steps)
+    {
+      motor->state = MOTOR_STATE_DECEL;
+      motor->current_period = (motor->current_period * 1000000000000LL) / (1000000000000LL - motor->decel * motor->current_period * MAX_MOTOR_COUNT);
+    }
+    else
+    {
+      motor->state = MOTOR_STATE_CRUISE;
+      motor->current_period = motor->target_period;
+    }
+  }
+
   return true;
 }
