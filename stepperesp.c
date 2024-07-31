@@ -17,6 +17,12 @@
 #include "esp_check.h"
 
 /******************************/
+/*      Macros Definitions    */
+/******************************/
+#define TIMER_CB_PERIOD 100
+#define MOTOR_MIN_SPEED 5.0f
+
+/******************************/
 /*     Static Variables       */
 /******************************/
 #define TAG "stepper-esp"
@@ -32,25 +38,27 @@ typedef struct
 
   enum motor_state state;
   enum motor_dir dir;
+  bool step_state;
   bool ready;
   bool is_en_pin; 
 
   uint32_t timer_us;
   uint32_t remaining_steps;
   uint32_t traveled_steps;
-  enum motor_profile profile;
-  uint32_t target_speed;
-  uint32_t current_speed;
+  float target_speed;
+  float current_speed;
+  enum motor_profile_type profile;
   uint32_t accel;
   uint32_t decel;
-  uint32_t accel_inc;
-  uint32_t decel_inc;
+  uint32_t accel_inc_us;
+  uint32_t decel_inc_us;
   uint32_t accel_steps;
   uint32_t decel_steps;
   uint32_t real_step_per_rev;
 } motor_ctrl_t;
 
 static gptimer_handle_t timer_handle;
+static motor_handle_t *handles[MAX_MOTOR_COUNT] = {  };
 static motor_ctrl_t *motors[MAX_MOTOR_COUNT] = {  };
 static uint8_t motor_count = 0;
 
@@ -69,6 +77,7 @@ esp_err_t motor_create(struct motor_config *config, motor_handle_t *handle)
   ESP_RETURN_ON_FALSE(motor_count < MAX_MOTOR_COUNT, -1, TAG, "max motor count reached");
 
   /* Check if the config is legit */
+  ESP_RETURN_ON_FALSE(config->steps_per_rev >= 20 && config->steps_per_rev <= 2000, -1, TAG, "invalid step angle");
   ESP_RETURN_ON_FALSE(GPIO_IS_VALID_OUTPUT_GPIO(config->dir_pin), -1, TAG, "dir gpio not valid");
   ESP_RETURN_ON_FALSE(GPIO_IS_VALID_OUTPUT_GPIO(config->step_pin), -1, TAG, "step gpio not valid");
   bool is_en_pin = true;
@@ -91,12 +100,12 @@ esp_err_t motor_create(struct motor_config *config, motor_handle_t *handle)
       .clk_src = GPTIMER_CLK_SRC_DEFAULT,
       .direction = GPTIMER_COUNT_UP,
       .resolution_hz = 1 * 1000 * 1000,
-      .intr_priority = 0
+      .intr_priority = 1
     };
 
     static gptimer_alarm_config_t alarm_cfg =
     {
-      .alarm_count = 10,
+      .alarm_count = TIMER_CB_PERIOD,
       .reload_count = 0,
       .flags = { .auto_reload_on_alarm = true }
     };
@@ -119,7 +128,9 @@ esp_err_t motor_create(struct motor_config *config, motor_handle_t *handle)
   {
     if (motors[i] == NULL)
     {
+      handles[i] = handle;
       motors[i] = motor;
+      motors[i]->ready = false;
       break;
     }
   }
@@ -128,7 +139,7 @@ esp_err_t motor_create(struct motor_config *config, motor_handle_t *handle)
   gpio_reset_pin(config->dir_pin);
   gpio_set_direction(config->dir_pin, GPIO_MODE_OUTPUT);
   gpio_reset_pin(config->step_pin);
-  gpio_set_direction(config->en_pin, GPIO_MODE_OUTPUT);
+  gpio_set_direction(config->step_pin, GPIO_MODE_OUTPUT);
   if (is_en_pin)
   {
     gpio_reset_pin(config->en_pin);
@@ -141,13 +152,255 @@ esp_err_t motor_create(struct motor_config *config, motor_handle_t *handle)
   memcpy(motor, config, sizeof(struct motor_config));
   motor->is_en_pin = is_en_pin;
   motor->real_step_per_rev = config->steps_per_rev * config->microsteps;
+  if (config->microsteps == 0) motor->microsteps = 1;
 
   motor_count++;
   ESP_LOGI(TAG, "motor %c created", config->name);
   return ESP_OK;
 }
 
+#define GET_MOTOR(handle, code) \
+  (motor_ctrl_t *)handle; \
+  ESP_RETURN_ON_FALSE(handle != NULL, code, TAG, "null motor");
+
+esp_err_t motor_enable(motor_handle_t handle)
+{
+  motor_ctrl_t *motor = GET_MOTOR(handle, -1);
+
+  if (motor->is_en_pin) gpio_set_level(motor->en_pin, 0);
+  motor->state = MOTOR_STATE_STILL;
+
+  return ESP_OK;
+}
+
+esp_err_t motor_disable(motor_handle_t handle)
+{
+  motor_ctrl_t *motor = GET_MOTOR(handle, -1);
+
+  if (motor->is_en_pin) gpio_set_level(motor->en_pin, 1);
+  motor->state = MOTOR_STATE_DISABLE;
+
+  return ESP_OK;
+}
+
+esp_err_t motor_delete(motor_handle_t *handle)
+{
+  motor_ctrl_t *motor = GET_MOTOR(*handle, -1);
+
+  char name_cp = motor->name;
+
+  /* Delete timer if the last motor was removed */
+  uint8_t motor_count_cp = motor_count - 1;
+  if (motor_count_cp <= 0)
+  {
+    gptimer_stop(timer_handle);
+    gptimer_disable(timer_handle);
+    ESP_RETURN_ON_ERROR(gptimer_del_timer(timer_handle), TAG, "failed to delete motor timer");
+  }
+
+  motor_count--;
+
+  for (int i = 0; i < MAX_MOTOR_COUNT; i++)
+  {
+    if (motor == motors[i])
+    {
+      free(motor);
+      *handle = NULL;
+      handles[i] = NULL;
+      motors[i] = NULL;
+      break;
+    }
+  }
+
+  ESP_LOGW(TAG, "motor %c deleted", name_cp);
+  return ESP_OK;
+}
+
+esp_err_t motor_delete_all()
+{
+  for (int i = 0; i < MAX_MOTOR_COUNT; i++)
+  {
+    if (handles[i] != NULL)
+    {
+      esp_err_t ret = motor_delete(handles[i]);
+      if (ret != ESP_OK) return ret;
+    }
+  }
+
+  return ESP_OK;
+}
+
+
+esp_err_t motor_turn(motor_handle_t handle, int32_t steps, uint32_t speed)
+{
+  motor_ctrl_t *motor = GET_MOTOR(handle, -1);
+  if (speed == 0 || steps == 0) return 0; 
+  ESP_RETURN_ON_FALSE(motor->state != MOTOR_STATE_DISABLE, -1, TAG, "enable %c motor first", motor->name);
+  ESP_RETURN_ON_FALSE(motor->state == MOTOR_STATE_STILL, -1, TAG, "%c motor is already running", motor->name);
+
+  /* Set motor direction */
+  motor->dir = (steps > 0 ? MOTOR_DIR_CW : MOTOR_DIR_CCW);
+  gpio_set_level(motor->dir_pin, motor->dir);
+
+  /* Calculations */
+  steps = abs(steps);
+  motor->timer_us = 0;
+  motor->traveled_steps = 0;
+  motor->remaining_steps = steps;
+  motor->target_speed = speed;
+  motor->current_speed = motor->profile == MOTOR_PROFILE_CONSTANT ? speed : MOTOR_MIN_SPEED;
+
+  if (motor->profile == MOTOR_PROFILE_LINEAR)
+  {
+    motor->accel_steps = (speed * speed - motor->current_speed * motor->current_speed) / (2 * motor->accel);
+    motor->decel_steps = (speed * speed - motor->current_speed * motor->current_speed) / (2 * motor->decel);
+
+    if (motor->accel_steps > steps / 2) motor->accel_steps = steps / 2;
+    if (motor->decel_steps > steps / 2) motor->decel_steps = steps / 2;
+  }
+
+  gpio_set_level(motor->step_pin, 1);
+  motor->step_state = 1;
+  motor->ready = true;
+
+  return ESP_OK;
+}
+
+
+float motor_get_current_speed(motor_handle_t handle)
+{
+  motor_ctrl_t *motor = GET_MOTOR(handle, 0);
+  return motor->current_speed;
+}
+
+float motor_get_target_speed(motor_handle_t handle)
+{
+  motor_ctrl_t *motor = GET_MOTOR(handle, 0);
+  return motor->target_speed;
+}
+
+enum motor_state motor_get_state(motor_handle_t handle)
+{
+  motor_ctrl_t *motor = GET_MOTOR(handle, -1);
+  return motor->state;
+}
+
+uint32_t motor_get_remaining_steps(motor_handle_t handle)
+{
+  motor_ctrl_t *motor = GET_MOTOR(handle, 0);
+  return motor->remaining_steps;
+}
+
+uint32_t motor_get_traveled_steps(motor_handle_t handle)
+{
+  motor_ctrl_t *motor = GET_MOTOR(handle, 0);
+  return motor->traveled_steps;
+}
+
+uint16_t motor_get_microstepping(motor_handle_t handle)
+{
+  motor_ctrl_t *motor = GET_MOTOR(handle, 0);
+  return motor->microsteps;
+}
+
+uint16_t motor_get_steps_per_rev(motor_handle_t handle)
+{
+  motor_ctrl_t *motor = GET_MOTOR(handle, 0);
+  return motor->steps_per_rev;
+}
+
+char motor_get_name(motor_handle_t handle)
+{
+  motor_ctrl_t *motor = GET_MOTOR(handle, '\0');
+  return motor->name;
+}
+
+esp_err_t motor_set_profile(motor_handle_t handle, struct motor_profile_config *profile)
+{
+  motor_ctrl_t *motor = GET_MOTOR(handle, -1);
+  ESP_RETURN_ON_FALSE(profile != NULL, -1, TAG, "profile is null");
+
+  /* memcpy(motor + offsetof(motor_ctrl_t, profile), profile, sizeof(struct motor_profile_config)); */
+  motor->accel = profile->accel;
+  motor->decel = profile->decel;
+  motor->profile = profile->type;
+
+  return ESP_OK;
+}
+
+
+// ISR
 bool timer_callback(gptimer_handle_t timer, const gptimer_alarm_event_data_t *edata, void *user_ctx)
 {
+  for (int i = 0; i < MAX_MOTOR_COUNT; i++)
+  {
+    motor_ctrl_t *motor = motors[i];
+    if (motor == NULL || !motor->ready) continue;
+
+    /* Destination reached */
+    if (motor->remaining_steps <= 0)
+    {
+      gpio_set_level(motor->step_pin, 0);
+      motor->step_state = 0;
+      motor->state = MOTOR_STATE_STILL;
+      motor->ready = false;
+
+      motor->timer_us = 0;
+      motor->traveled_steps = 0;
+      motor->target_speed = 0;
+      motor->current_speed = 0;
+      continue;
+    }
+
+    motor->timer_us += TIMER_CB_PERIOD;
+
+    /* Calculations */
+    uint32_t period = (uint32_t)(1000000.0f / motor->current_speed);
+    uint32_t on_period = 30 * period / 100;
+    if (on_period < 2) on_period = 2;
+
+    if (motor->timer_us >= period)
+    {
+      motor->timer_us = 0;
+      motor->remaining_steps--;
+      motor->traveled_steps++;
+
+      if (motor->traveled_steps < motor->accel_steps)
+      {
+        motor->state = MOTOR_STATE_ACCEL;
+        motor->current_speed += (float)motor->accel * (float)period / 1000000.0f;
+        if (motor->current_speed > motor->target_speed) motor->current_speed = motor->target_speed;
+      }
+      else if (motor->remaining_steps < motor->decel_steps)
+      {
+        motor->state = MOTOR_STATE_DECEL;
+        motor->current_speed -= (float)motor->decel * (float)period / 1000000.0f;
+        if (motor->current_speed < MOTOR_MIN_SPEED) motor->current_speed =  MOTOR_MIN_SPEED;
+      }
+      else
+      {
+        motor->state = MOTOR_STATE_CRUISE;
+        motor->current_speed = motor->target_speed;
+      }
+    }
+
+    if (motor->timer_us <= on_period)
+    {
+      if (motor->step_state == 0) 
+      {
+        gpio_set_level(motor->step_pin, 1);
+        motor->step_state = 1;
+      }
+    }
+    else
+    {
+      if (motor->step_state == 1)
+      {
+        gpio_set_level(motor->step_pin, 0);
+        motor->step_state = 0;
+      }
+    }
+  }
+
   return true;
 }
