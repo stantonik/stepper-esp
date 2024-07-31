@@ -41,10 +41,17 @@ enum motor_dir : uint8_t
   MOTOR_DIR_CCW
 };
 
-enum motor_profile : uint8_t
+enum motor_profile_type : uint8_t
 {
   MOTOR_PROFILE_CONSTANT,
   MOTOR_PROFILE_LINEAR,
+};
+
+struct motor_profile_config
+{
+  enum motor_profile_type type;
+  uint32_t accel;
+  uint32_t decel;
 };
 
 struct motor_config
@@ -67,26 +74,27 @@ typedef void* motor_handle_t;
 /*   Function Declarations    */
 /******************************/
 extern esp_err_t motor_create(struct motor_config *config, motor_handle_t *handle);
-
-// TODO :
 extern esp_err_t motor_enable(motor_handle_t handle);
 extern esp_err_t motor_disable(motor_handle_t handle);
-extern esp_err_t motor_stop(motor_handle_t handle);
-extern esp_err_t motor_delete(motor_handle_t handle);
+extern esp_err_t motor_delete(motor_handle_t *handle);
 extern esp_err_t motor_delete_all();
-
-extern esp_err_t motor_turn(motor_handle_t handle, int32_t steps, uint32_t speed);
 
 extern uint32_t motor_get_current_speed(motor_handle_t handle);
 extern uint32_t motor_get_target_speed(motor_handle_t handle);
-extern uint32_t motor_get_state(motor_handle_t handle);
+extern enum motor_state motor_get_state(motor_handle_t handle);
 extern uint32_t motor_get_remaining_steps(motor_handle_t handle);
 extern uint32_t motor_get_traveled_steps(motor_handle_t handle);
 extern uint16_t motor_get_microstepping(motor_handle_t handle);
 extern uint16_t motor_get_steps_per_rev(motor_handle_t handle);
 extern char motor_get_name(motor_handle_t handle);
 
-extern esp_err_t motor_set_profile(motor_handle_t handle, enum motor_profile *profie);
+extern esp_err_t motor_set_profile(motor_handle_t handle, struct motor_profile_config *profile);
+
+// TODO :
+extern esp_err_t motor_stop(motor_handle_t handle);
+
+extern esp_err_t motor_turn(motor_handle_t handle, int32_t steps, uint32_t speed);
+
 
 #ifdef __cplusplus
 }
