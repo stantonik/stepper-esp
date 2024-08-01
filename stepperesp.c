@@ -11,6 +11,7 @@
 
 #include <string.h>
 #include <stddef.h>
+#include <math.h>
 
 #include "driver/gptimer.h"
 #include "driver/gpio.h"
@@ -19,14 +20,13 @@
 /******************************/
 /*      Macros Definitions    */
 /******************************/
-#define TIMER_CB_PERIOD 100
-#define MOTOR_MIN_SPEED 5.0f
+#define TAG "stepper-esp"
+
+#define TIMER_CB_PERIOD 10
 
 /******************************/
 /*     Static Variables       */
 /******************************/
-#define TAG "stepper-esp"
-
 typedef struct
 {
   gpio_num_t dir_pin;
@@ -42,19 +42,20 @@ typedef struct
   bool ready;
   bool is_en_pin; 
 
-  uint32_t timer_us;
+  float lead_mm;
+  float lin_displacement_coef;
+  uint32_t timer;
   uint32_t remaining_steps;
   uint32_t traveled_steps;
-  float target_speed;
-  float current_speed;
+  int32_t pos;
+  uint32_t current_period;
+  uint32_t target_period;
+  int32_t div_rest;
   enum motor_profile_type profile;
   uint32_t accel;
   uint32_t decel;
-  uint32_t accel_inc_us;
-  uint32_t decel_inc_us;
   uint32_t accel_steps;
   uint32_t decel_steps;
-  uint32_t real_step_per_rev;
 } motor_ctrl_t;
 
 static gptimer_handle_t timer_handle;
@@ -100,7 +101,7 @@ esp_err_t motor_create(struct motor_config *config, motor_handle_t *handle)
       .clk_src = GPTIMER_CLK_SRC_DEFAULT,
       .direction = GPTIMER_COUNT_UP,
       .resolution_hz = 1 * 1000 * 1000,
-      .intr_priority = 1
+      .intr_priority = 0
     };
 
     static gptimer_alarm_config_t alarm_cfg =
@@ -151,7 +152,6 @@ esp_err_t motor_create(struct motor_config *config, motor_handle_t *handle)
   *motor = (motor_ctrl_t){  };
   memcpy(motor, config, sizeof(struct motor_config));
   motor->is_en_pin = is_en_pin;
-  motor->real_step_per_rev = config->steps_per_rev * config->microsteps;
   if (config->microsteps == 0) motor->microsteps = 1;
 
   motor_count++;
@@ -230,13 +230,27 @@ esp_err_t motor_delete_all()
   return ESP_OK;
 }
 
+esp_err_t motor_turn_mm(motor_handle_t handle, float x, float speed)
+{
+  motor_ctrl_t *motor = GET_MOTOR(handle, -1);
+  ESP_RETURN_ON_FALSE(motor->lead_mm > 0, -1, TAG, "invalid lead for %c motor", motor->name);
+  return motor_turn_full_step(handle, x * motor->lin_displacement_coef, speed * motor->lin_displacement_coef);
+}
 
-esp_err_t motor_turn(motor_handle_t handle, int32_t steps, uint32_t speed)
+esp_err_t motor_turn(motor_handle_t handle, float steps, float speed)
+{
+  motor_ctrl_t *motor = GET_MOTOR(handle, -1);
+  return motor_turn(handle, steps * motor->microsteps, speed * motor->microsteps);
+}
+
+esp_err_t motor_turn_full_step(motor_handle_t handle, int32_t steps, float speed)
 {
   motor_ctrl_t *motor = GET_MOTOR(handle, -1);
   if (speed == 0 || steps == 0) return 0; 
   ESP_RETURN_ON_FALSE(motor->state != MOTOR_STATE_DISABLE, -1, TAG, "enable %c motor first", motor->name);
   ESP_RETURN_ON_FALSE(motor->state == MOTOR_STATE_STILL, -1, TAG, "%c motor is already running", motor->name);
+
+  motor->state = MOTOR_STATE_ACCEL;
 
   /* Set motor direction */
   motor->dir = (steps > 0 ? MOTOR_DIR_CW : MOTOR_DIR_CCW);
@@ -244,19 +258,20 @@ esp_err_t motor_turn(motor_handle_t handle, int32_t steps, uint32_t speed)
 
   /* Calculations */
   steps = abs(steps);
-  motor->timer_us = 0;
-  motor->traveled_steps = 0;
   motor->remaining_steps = steps;
-  motor->target_speed = speed;
-  motor->current_speed = motor->profile == MOTOR_PROFILE_CONSTANT ? speed : MOTOR_MIN_SPEED;
+  motor->current_period = (1e+6) * 0.676f * sqrt(2.0f / (float)motor->accel);
+  motor->target_period = (1e+6) / speed;
 
+  // see -> Atmel AVR446: Linear speed control of stepper motor, 2006
   if (motor->profile == MOTOR_PROFILE_LINEAR)
   {
-    motor->accel_steps = (speed * speed - motor->current_speed * motor->current_speed) / (2 * motor->accel);
-    motor->decel_steps = (speed * speed - motor->current_speed * motor->current_speed) / (2 * motor->decel);
-
-    if (motor->accel_steps > steps / 2) motor->accel_steps = steps / 2;
-    if (motor->decel_steps > steps / 2) motor->decel_steps = steps / 2;
+    motor->accel_steps = speed * speed / (2 * motor->accel);
+    motor->decel_steps = motor->accel_steps * motor->accel / motor->decel;
+    if (steps < motor->accel_steps + motor->decel_steps)
+    {
+      motor->accel_steps = steps * motor->decel / (motor->accel + motor->decel);
+      motor->decel_steps = steps - motor->accel_steps;
+    }
   }
 
   gpio_set_level(motor->step_pin, 1);
@@ -270,13 +285,13 @@ esp_err_t motor_turn(motor_handle_t handle, int32_t steps, uint32_t speed)
 float motor_get_current_speed(motor_handle_t handle)
 {
   motor_ctrl_t *motor = GET_MOTOR(handle, 0);
-  return motor->current_speed;
+  return (1e+6) / (float)motor->current_period;
 }
 
 float motor_get_target_speed(motor_handle_t handle)
 {
   motor_ctrl_t *motor = GET_MOTOR(handle, 0);
-  return motor->target_speed;
+  return (1e+6) / (float)motor->target_period;
 }
 
 enum motor_state motor_get_state(motor_handle_t handle)
@@ -289,12 +304,6 @@ uint32_t motor_get_remaining_steps(motor_handle_t handle)
 {
   motor_ctrl_t *motor = GET_MOTOR(handle, 0);
   return motor->remaining_steps;
-}
-
-uint32_t motor_get_traveled_steps(motor_handle_t handle)
-{
-  motor_ctrl_t *motor = GET_MOTOR(handle, 0);
-  return motor->traveled_steps;
 }
 
 uint16_t motor_get_microstepping(motor_handle_t handle)
@@ -315,15 +324,47 @@ char motor_get_name(motor_handle_t handle)
   return motor->name;
 }
 
+enum motor_dir motor_get_direction(motor_handle_t handle)
+{
+  motor_ctrl_t *motor = GET_MOTOR(handle, 0);
+  return motor->dir;
+}
+
+float motor_get_position_mm(motor_handle_t handle)
+{
+  motor_ctrl_t *motor = GET_MOTOR(handle, 0);
+  return motor->pos / motor->lin_displacement_coef;
+}
+
+float motor_get_position(motor_handle_t handle)
+{
+  motor_ctrl_t *motor = GET_MOTOR(handle, 0);
+  return motor->pos / (float)motor->microsteps;
+}
+
+int32_t motor_get_position_fullstep(motor_handle_t handle)
+{
+  motor_ctrl_t *motor = GET_MOTOR(handle, 0);
+  return motor->pos;
+}
+
 esp_err_t motor_set_profile(motor_handle_t handle, struct motor_profile_config *profile)
 {
   motor_ctrl_t *motor = GET_MOTOR(handle, -1);
   ESP_RETURN_ON_FALSE(profile != NULL, -1, TAG, "profile is null");
 
-  /* memcpy(motor + offsetof(motor_ctrl_t, profile), profile, sizeof(struct motor_profile_config)); */
-  motor->accel = profile->accel;
-  motor->decel = profile->decel;
-  motor->profile = profile->type;
+  memcpy(&(motor->profile), profile, sizeof(struct motor_profile_config));
+
+  return ESP_OK;
+}
+
+esp_err_t motor_set_lead(motor_handle_t handle, float lead_mm)
+{
+  motor_ctrl_t *motor = GET_MOTOR(handle, -1);
+  ESP_RETURN_ON_FALSE(lead_mm > 0, -1, TAG, "invalid lead for %c motor", motor->name);
+
+  motor->lead_mm = lead_mm;
+  motor->lin_displacement_coef = motor->steps_per_rev * motor->microsteps / motor->lead_mm;
 
   return ESP_OK;
 }
@@ -345,46 +386,49 @@ bool timer_callback(gptimer_handle_t timer, const gptimer_alarm_event_data_t *ed
       motor->state = MOTOR_STATE_STILL;
       motor->ready = false;
 
-      motor->timer_us = 0;
+      motor->timer = 0;
       motor->traveled_steps = 0;
-      motor->target_speed = 0;
-      motor->current_speed = 0;
+      motor->target_period = 0;
+      motor->current_period = 0;
       continue;
     }
 
-    motor->timer_us += TIMER_CB_PERIOD;
+    motor->timer += TIMER_CB_PERIOD;
 
     /* Calculations */
-    uint32_t period = (uint32_t)(1000000.0f / motor->current_speed);
-    uint32_t on_period = 30 * period / 100;
+    uint32_t on_period = 30 * motor->current_period / 100;
     if (on_period < 2) on_period = 2;
+    if (on_period > 200) on_period = 200;
 
-    if (motor->timer_us >= period)
+    if (motor->timer >= motor->current_period)
     {
-      motor->timer_us = 0;
+      motor->timer = 0;
       motor->remaining_steps--;
       motor->traveled_steps++;
+      motor->pos += motor->dir == MOTOR_DIR_CW ? 1: -1;
 
+      // see -> Atmel AVR446: Linear speed control of stepper motor, 2006
       if (motor->traveled_steps < motor->accel_steps)
       {
         motor->state = MOTOR_STATE_ACCEL;
-        motor->current_speed += (float)motor->accel * (float)period / 1000000.0f;
-        if (motor->current_speed > motor->target_speed) motor->current_speed = motor->target_speed;
+        motor->current_period = (int32_t)motor->current_period - (2 * (int32_t)motor->current_period + motor->div_rest) / (1 + 4 * (int32_t)motor->traveled_steps);
+        motor->div_rest = (2 * (int32_t)motor->current_period + motor->div_rest) % (1 + 4 * (int32_t)motor->traveled_steps);
       }
-      else if (motor->remaining_steps < motor->decel_steps)
+      else if (motor->remaining_steps <= motor->decel_steps)
       {
         motor->state = MOTOR_STATE_DECEL;
-        motor->current_speed -= (float)motor->decel * (float)period / 1000000.0f;
-        if (motor->current_speed < MOTOR_MIN_SPEED) motor->current_speed =  MOTOR_MIN_SPEED;
+        motor->current_period = (int32_t)motor->current_period - (2 * (int32_t)motor->current_period + motor->div_rest) / (int32_t)(1 - 4 * (int32_t)motor->remaining_steps);
+        motor->div_rest = (2 * (int32_t)motor->current_period + motor->div_rest) % (int32_t)(1 - 4 * (int32_t)motor->remaining_steps);
       }
       else
       {
         motor->state = MOTOR_STATE_CRUISE;
-        motor->current_speed = motor->target_speed;
+        motor->current_period = motor->target_period;
+        motor->div_rest = 0;
       }
     }
 
-    if (motor->timer_us <= on_period)
+    if (motor->timer <= on_period)
     {
       if (motor->step_state == 0) 
       {

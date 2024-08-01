@@ -73,27 +73,34 @@ typedef void* motor_handle_t;
 /******************************/
 /*   Function Declarations    */
 /******************************/
+
 extern esp_err_t motor_create(struct motor_config *config, motor_handle_t *handle);
 extern esp_err_t motor_enable(motor_handle_t handle);
 extern esp_err_t motor_disable(motor_handle_t handle);
 extern esp_err_t motor_delete(motor_handle_t *handle);
 extern esp_err_t motor_delete_all();
 
+extern esp_err_t motor_turn_mm(motor_handle_t handle, float x, float speed);
+extern esp_err_t motor_turn_full_step(motor_handle_t handle, int32_t steps, float speed);
+extern esp_err_t motor_turn(motor_handle_t handle, float steps, float speed);
+
 extern float motor_get_current_speed(motor_handle_t handle);
 extern float motor_get_target_speed(motor_handle_t handle);
 extern enum motor_state motor_get_state(motor_handle_t handle);
 extern uint32_t motor_get_remaining_steps(motor_handle_t handle);
-extern uint32_t motor_get_traveled_steps(motor_handle_t handle);
 extern uint16_t motor_get_microstepping(motor_handle_t handle);
 extern uint16_t motor_get_steps_per_rev(motor_handle_t handle);
 extern char motor_get_name(motor_handle_t handle);
+extern enum motor_dir motor_get_direction(motor_handle_t handle);
+extern int32_t motor_get_position_fullstep(motor_handle_t handle);
+extern float motor_get_position(motor_handle_t handle);
+extern float motor_get_position_mm(motor_handle_t handle);
 
 extern esp_err_t motor_set_profile(motor_handle_t handle, struct motor_profile_config *profile);
+extern esp_err_t motor_set_lead(motor_handle_t handle, float lead_mm);
 
 // TODO :
 extern esp_err_t motor_stop(motor_handle_t handle);
-
-extern esp_err_t motor_turn(motor_handle_t handle, int32_t steps, uint32_t speed);
 
 
 #ifdef __cplusplus
