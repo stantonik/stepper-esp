@@ -73,6 +73,7 @@ typedef void* motor_handle_t;
 /******************************/
 /*   Function Declarations    */
 /******************************/
+
 extern esp_err_t motor_create(struct motor_config *config, motor_handle_t *handle);
 extern esp_err_t motor_enable(motor_handle_t handle);
 extern esp_err_t motor_disable(motor_handle_t handle);
