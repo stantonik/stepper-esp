@@ -82,7 +82,7 @@ esp_err_t motor_create(struct motor_config *config, motor_handle_t *handle)
   ESP_RETURN_ON_FALSE(GPIO_IS_VALID_OUTPUT_GPIO(config->dir_pin), -1, TAG, "dir gpio not valid");
   ESP_RETURN_ON_FALSE(GPIO_IS_VALID_OUTPUT_GPIO(config->step_pin), -1, TAG, "step gpio not valid");
   bool is_en_pin = true;
-  if (config->en_pin == 0)
+  if (config->en_pin == GPIO_NUM_NC)
   {
     is_en_pin = false;
   }
